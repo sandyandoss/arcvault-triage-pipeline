@@ -73,7 +73,7 @@ The full n8n canvas showing all 14 nodes wired in sequence. Left to right: Webho
 
 ### 2.2 — Execution History
 
-![Execution History](screenshots/02-n8n%20Executions%20tab.png)
+![Execution History](screenshots/02-n8n-executions-tab.png)
 
 Six executions shown, all succeeded. Execution times range from 6.0 to 7.8 seconds — consistent with two sequential Groq API calls per message. The highlighted execution (May 16, 21:09:02, 6.756s) is Sample 5, which is the source of all node-level screenshots below.
 
@@ -549,8 +549,6 @@ The key structural decision was injecting `category` and `priority` from Call 1 
   }
 ]
 
-## 9. Screenshots of each step with output
-![Canvas Overview](screenshots/01_n8n-workflow-canvas.png)
 
 
 ```
