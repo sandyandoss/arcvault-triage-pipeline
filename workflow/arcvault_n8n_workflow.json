@@ -1,0 +1,324 @@
+{
+  "name": "ArcVault Intake Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## ArcVault Intake Pipeline — Setup\n\n**Before activating, complete these steps:**\n\n1. **Groq API Key**\n   - Get free key at console.groq.com\n   - In each HTTP Request node (Classify Message, Enrich Message), replace `YOUR_GROQ_API_KEY` in the Authorization header\n\n2. **Google Sheets**\n   - Create a Google Sheet with two tabs: `Main Output` and `Escalation Queue`\n   - Add these headers to both tabs (row 1):\n     `input_id | source | raw_message | received_at | category | priority | confidence_score | core_issue | identifiers | urgency_signal | billing_delta | escalation_keywords_found | destination_queue | standard_destination | is_escalated | escalation_reasons | summary | processed_at`\n   - In both Google Sheets nodes, replace `YOUR_GOOGLE_SHEET_ID` with your sheet's ID (from the URL)\n   - Connect your Google account via n8n credentials\n\n3. **Webhook.site**\n   - Visit webhook.site and copy your unique URL\n   - Replace `YOUR_WEBHOOK_SITE_URL` in the two Notify nodes\n\n4. **Test**\n   - Activate the workflow, copy the webhook URL from the Webhook Trigger node\n   - POST each sample input as JSON: `{ \"source\": \"Email\", \"raw_message\": \"...\" }`",
+        "height": 480,
+        "width": 560,
+        "color": 5
+      },
+      "id": "sticky-setup",
+      "name": "Setup Instructions",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [0, 60]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "arcvault-intake",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "node-webhook",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [620, 300],
+      "webhookId": "arcvault-intake"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const body = $input.item.json;\nconst ts = new Date().toISOString();\nconst id = 'ARC-' + ts.replace(/[-:.TZ]/g, '').slice(0, 12);\n\nreturn {\n  json: {\n    input_id: id,\n    source: body.source || 'Unknown',\n    raw_message: body.raw_message || '',\n    received_at: ts\n  }\n};"
+      },
+      "id": "node-normalize",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const d = $input.item.json;\n\nconst systemPrompt = 'You are a support ticket classifier for ArcVault, a B2B SaaS platform. Analyze inbound customer messages and classify them accurately. Respond with valid JSON only. No markdown, no explanation.';\n\nconst userPrompt = 'Classify the customer message below.\\n\\nSource: ' + d.source + '\\nMessage: ' + d.raw_message + '\\n\\nReturn JSON with these exact fields:\\n- category: one of Bug Report, Feature Request, Billing Issue, Technical Question, Incident/Outage\\n- priority: Low, Medium, or High\\n- confidence_score: float between 0.0 and 1.0\\n\\nPriority rules:\\n  High = service down, multiple users affected, data loss risk, billing error\\n  Medium = single user blocked, compliance need, billing discrepancy\\n  Low = general inquiry, feature suggestion, non-urgent question\\n\\nConfidence rules:\\n  0.90-1.0 = message clearly maps to one category\\n  0.70-0.89 = mostly clear with minor ambiguity\\n  0.50-0.69 = could reasonably fit multiple categories\\n  below 0.50 = insufficient information to classify';\n\nreturn {\n  json: {\n    ...d,\n    groq_body: {\n      model: 'llama-3.3-70b-versatile',\n      messages: [\n        { role: 'system', content: systemPrompt },\n        { role: 'user', content: userPrompt }\n      ],\n      temperature: 0.1,\n      response_format: { type: 'json_object' }\n    }\n  }\n};"
+      },
+      "id": "node-build-classify",
+      "name": "Build Classification Body",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1060, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_GROQ_API_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json.groq_body) }}",
+        "options": {}
+      },
+      "id": "node-classify",
+      "name": "Classify Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1280, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const response = $input.item.json;\nconst rawContent = response.choices[0].message.content;\nconst cleaned = rawContent.replace(/```(?:json)?\\n?|\\n?```/g, '').trim();\n\nlet parsed;\ntry {\n  parsed = JSON.parse(cleaned);\n} catch(e) {\n  parsed = { category: 'Unrecognized', priority: 'Medium', confidence_score: 0.0 };\n}\n\nconst prev = $('Normalize Input').item.json;\n\nreturn {\n  json: {\n    input_id: prev.input_id,\n    source: prev.source,\n    raw_message: prev.raw_message,\n    received_at: prev.received_at,\n    category: parsed.category || 'Unrecognized',\n    priority: parsed.priority || 'Medium',\n    confidence_score: typeof parsed.confidence_score === 'number' ? parsed.confidence_score : 0.0\n  }\n};"
+      },
+      "id": "node-parse-classify",
+      "name": "Parse Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1500, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const d = $input.item.json;\n\nconst systemPrompt = 'You are a support ticket enrichment agent for ArcVault, a B2B SaaS platform. Extract structured information to help the receiving team act immediately. Respond with valid JSON only. No markdown, no explanation.';\n\nconst userPrompt = 'Extract structured information from the customer message below.\\n\\nSource: ' + d.source + '\\nMessage: ' + d.raw_message + '\\nCategory: ' + d.category + '\\nPriority: ' + d.priority + '\\n\\nReturn JSON with these exact fields:\\n- core_issue: one sentence describing what the customer needs\\n- identifiers: object with account_id, invoice_number, error_code, other (each extracted or null)\\n- urgency_signal: one of Immediate, Same-day, Next-business-day, No urgency\\n- billing_delta: numeric dollar difference if a billing discrepancy is mentioned, else null\\n- escalation_keywords_found: array of any matching phrases found: outage, down for all users, multiple users affected\\n- summary: 2-3 sentences for the receiving team, written in third person, actionable tone\\n\\nUrgency rules:\\n  Immediate = outage, multiple users affected, security incident\\n  Same-day = single user blocked, billing dispute\\n  Next-business-day = compliance need, integration evaluation\\n  No urgency = general question, feature suggestion';\n\nreturn {\n  json: {\n    ...d,\n    groq_body: {\n      model: 'llama-3.3-70b-versatile',\n      messages: [\n        { role: 'system', content: systemPrompt },\n        { role: 'user', content: userPrompt }\n      ],\n      temperature: 0.1,\n      response_format: { type: 'json_object' }\n    }\n  }\n};"
+      },
+      "id": "node-build-enrich",
+      "name": "Build Enrichment Body",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1720, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_GROQ_API_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json.groq_body) }}",
+        "options": {}
+      },
+      "id": "node-enrich",
+      "name": "Enrich Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1940, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const response = $input.item.json;\nconst rawContent = response.choices[0].message.content;\nconst cleaned = rawContent.replace(/```(?:json)?\\n?|\\n?```/g, '').trim();\n\nlet enrichment;\ntry {\n  enrichment = JSON.parse(cleaned);\n} catch(e) {\n  enrichment = {\n    core_issue: 'Enrichment parsing failed — manual review required',\n    identifiers: { account_id: null, invoice_number: null, error_code: null, other: null },\n    urgency_signal: 'Same-day',\n    billing_delta: null,\n    escalation_keywords_found: [],\n    summary: 'Enrichment parsing failed. Manual review required.'\n  };\n}\n\nconst prev = $('Parse Classification').item.json;\n\nconst ROUTING_MAP = {\n  'Bug Report': 'Engineering',\n  'Incident/Outage': 'Engineering',\n  'Billing Issue': 'Billing',\n  'Feature Request': 'Product',\n  'Technical Question': 'IT/Security'\n};\n\nconst standardDestination = ROUTING_MAP[prev.category] || 'General';\nconst escalationReasons = [];\n\nif (prev.confidence_score < 0.70) {\n  escalationReasons.push('low_confidence:' + prev.confidence_score);\n}\nif ((enrichment.escalation_keywords_found || []).length > 0) {\n  escalationReasons.push('keywords:' + enrichment.escalation_keywords_found.join(','));\n}\nif (enrichment.billing_delta !== null && enrichment.billing_delta !== undefined && enrichment.billing_delta > 500) {\n  escalationReasons.push('billing_delta:$' + enrichment.billing_delta);\n}\n\nconst isEscalated = escalationReasons.length > 0;\n\nreturn {\n  json: {\n    input_id: prev.input_id,\n    source: prev.source,\n    raw_message: prev.raw_message,\n    received_at: prev.received_at,\n    category: prev.category,\n    priority: prev.priority,\n    confidence_score: prev.confidence_score,\n    core_issue: enrichment.core_issue,\n    identifiers: JSON.stringify(enrichment.identifiers),\n    urgency_signal: enrichment.urgency_signal,\n    billing_delta: enrichment.billing_delta,\n    escalation_keywords_found: JSON.stringify(enrichment.escalation_keywords_found || []),\n    destination_queue: isEscalated ? 'Escalation' : standardDestination,\n    standard_destination: standardDestination,\n    is_escalated: isEscalated,\n    escalation_reasons: JSON.stringify(escalationReasons),\n    summary: enrichment.summary,\n    processed_at: new Date().toISOString()\n  }\n};"
+      },
+      "id": "node-route",
+      "name": "Route and Escalate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2160, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-escalation",
+              "leftValue": "={{ $json.is_escalated }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals",
+                "rightType": "any"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if",
+      "name": "Escalation Check",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2380, 300]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Escalation Queue",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "node-sheets-escalation",
+      "name": "Append to Escalation Queue",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [2600, 160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "YOUR_WEBHOOK_SITE_URL",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "node-notify-escalation",
+      "name": "Notify Escalation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2820, 160]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Main Output",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "node-sheets-main",
+      "name": "Append to Main Output",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [2600, 440]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "YOUR_WEBHOOK_SITE_URL",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "node-notify-destination",
+      "name": "Notify Destination Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2820, 440]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [{ "node": "Normalize Input", "type": "main", "index": 0 }]
+      ]
+    },
+    "Normalize Input": {
+      "main": [
+        [{ "node": "Build Classification Body", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Classification Body": {
+      "main": [
+        [{ "node": "Classify Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Classify Message": {
+      "main": [
+        [{ "node": "Parse Classification", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Classification": {
+      "main": [
+        [{ "node": "Build Enrichment Body", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Enrichment Body": {
+      "main": [
+        [{ "node": "Enrich Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Enrich Message": {
+      "main": [
+        [{ "node": "Route and Escalate", "type": "main", "index": 0 }]
+      ]
+    },
+    "Route and Escalate": {
+      "main": [
+        [{ "node": "Escalation Check", "type": "main", "index": 0 }]
+      ]
+    },
+    "Escalation Check": {
+      "main": [
+        [{ "node": "Append to Escalation Queue", "type": "main", "index": 0 }],
+        [{ "node": "Append to Main Output", "type": "main", "index": 0 }]
+      ]
+    },
+    "Append to Escalation Queue": {
+      "main": [
+        [{ "node": "Notify Escalation", "type": "main", "index": 0 }]
+      ]
+    },
+    "Append to Main Output": {
+      "main": [
+        [{ "node": "Notify Destination Queue", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "arcvault-pipeline-v1"
+}
