@@ -5,13 +5,14 @@
 
 ## Table of Contents
 1. [System Overview](#1-system-overview)
-2. [Architecture Write-Up](#2-architecture-write-up)
-3. [Routing Logic](#3-routing-logic)
-4. [Escalation Logic](#4-escalation-logic)
-5. [Production Scale Considerations](#5-production-scale-considerations)
-6. [Phase 2 — Given Another Week](#6-phase-2--given-another-week)
-7. [Prompt Documentation](#7-prompt-documentation)
-8. [Structured Output — All 5 Records](#8-structured-output--all-5-records)
+2. [Workflow Evidence](#2-workflow-evidence)
+3. [Architecture Write-Up](#3-architecture-write-up)
+4. [Routing Logic](#4-routing-logic)
+5. [Escalation Logic](#5-escalation-logic)
+6. [Production Scale Considerations](#6-production-scale-considerations)
+7. [Phase 2 — Given Another Week](#7-phase-2--given-another-week)
+8. [Prompt Documentation](#8-prompt-documentation)
+9. [Structured Output — All 5 Records](#9-structured-output--all-5-records)
 
 ---
 
@@ -56,7 +57,109 @@
 
 ---
 
-## 2. Architecture Write-Up
+## 2. Workflow Evidence
+
+All screenshots below are taken from a live execution of Sample 5 — the multi-user outage message — because it exercises the escalation path end-to-end and is the most complete trace through the system. The execution history screenshot confirms all five samples were processed successfully.
+
+---
+
+### 2.1 — Workflow Canvas
+
+![Workflow Canvas](screenshots/01-n8n-workflow-canvas.png)
+
+The full n8n canvas showing all 14 nodes wired in sequence. Left to right: Webhook Trigger → Normalize Input → Build Classification Body → Classify Message → Parse Classification → Build Enrichment Body → Enrich Message → Route and Escalate → Escalation Check, which branches into the escalation path (top) and the standard routing path (bottom). The setup instructions sticky note is visible on the far left.
+
+---
+
+### 2.2 — Execution History
+
+![Execution History](screenshots/02-n8n%20Executions%20tab.png)
+
+Six executions shown, all succeeded. Execution times range from 6.0 to 7.8 seconds — consistent with two sequential Groq API calls per message. The highlighted execution (May 16, 21:09:02, 6.756s) is Sample 5, which is the source of all node-level screenshots below.
+
+---
+
+### 2.3 — Step 1: Ingestion — Webhook Trigger Output
+
+![Webhook Output](screenshots/03-webhook-output.png)
+
+The raw POST body received by the webhook. Source is `Web Form`, raw_message is Sample 5: *"Your dashboard stopped loading for us around 2pm EST. Checked our end it is definitely on yours. Multiple users affected."* The workflow path is `/arcvault-intake`.
+
+---
+
+### 2.4 — Step 1: Ingestion — Normalize Input Output
+
+![Normalize Output](screenshots/04_normalize_output.png)
+
+The Code node stamps a unique `input_id` and `received_at` timestamp onto the payload. The raw message is carried forward unchanged. This node's output is what both LLM calls draw from — `source` and `raw_message` are referenced directly in the prompt bodies built by the downstream Code nodes.
+
+---
+
+### 2.5 — Step 2: Classification — Raw Groq Response
+
+![Classification Raw Response](screenshots/05_classify_raw_response.png)
+
+The raw response from Groq (model: `llama-3.3-70b-versatile`). The `choices[0].message.content` field contains the LLM's JSON output: `category: "Incident/Outage"`, `priority: "High"`, `confidence_score: 0.95`. Total tokens: 326. Total latency for this call: 0.136 seconds.
+
+---
+
+### 2.6 — Step 2: Classification — Parsed Output
+
+![Parse Classification Output](screenshots/06_parse_classification_output.png)
+
+The Parse Classification Code node strips any markdown fences from the LLM response, parses the JSON, and merges the result with the normalized input fields. Output is a clean record: `category: "Incident/Outage"`, `priority: "High"`, `confidence_score: 0.95`. This is the data passed into the enrichment prompt as context.
+
+---
+
+### 2.7 — Step 3: Enrichment — Raw Groq Response
+
+![Enrichment Raw Response](screenshots/07_enrich_raw_response.png)
+
+The raw Groq response for the enrichment call. The content includes `core_issue`, a structured `identifiers` object, `urgency_signal: "Immediate"`, `escalation_keywords_found: ["multiple users affected"]`, and the human-readable `summary`. The category and priority injected from Step 2 are visible in the input panel on the left, confirming the context pass-through.
+
+---
+
+### 2.8 — Step 4: Routing — Route and Escalate Output
+
+![Route and Escalate Output](screenshots/08_route_and_escalate_output..png)
+
+The routing Code node produces the final record. Key fields: `destination_queue: "Escalation"`, `standard_destination: "Engineering"` (preserved so the human reviewer knows where it would have routed), `is_escalated: true`, `escalation_reasons: ["keywords:multiple users affected"]`. The `billing_delta` is null, confirming the escalation was triggered by keyword detection, not the billing threshold.
+
+---
+
+### 2.9 — Step 5: Escalation Check — IF Node (TRUE Branch)
+
+![Escalation Check](screenshots/09_escalation_check_true_branch.png)
+
+The IF node evaluates `$json.is_escalated === true`. For Sample 5 the TRUE branch fires, visible in the highlighted output path. The condition panel shows the single condition that gates this branch. The complete output record is visible on the right confirming all fields are populated correctly before the record is written to the Escalation Queue.
+
+---
+
+### 2.10 — Step 5: Output — Google Sheets Main Output Tab
+
+![Sheets Main Output](screenshots/10-sheet-main-output.png)
+
+The Main Output tab showing the four non-escalated records (Samples 1–4). Each row contains all 18 fields. The `destination_queue` column shows Engineering, Billing, Product, and IT/Security respectively — confirming the routing map is working correctly across all four standard paths.
+
+---
+
+### 2.11 — Step 5: Output — Google Sheets Escalation Queue Tab
+
+![Sheets Escalation Queue](screenshots/11-sheet-escalation-queue.png)
+
+The Escalation Queue tab containing Sample 5 only. All fields are populated: `category: Incident/Outage`, `destination_queue: Escalation`, `standard_destination: Engineering`, `is_escalated: TRUE`, `escalation_reasons: ["keywords:multiple users affected"]`, `urgency_signal: Immediate`, `processed_at: 2026-05-16T18:10:25.098Z`. The summary reads: *"The customer is experiencing a dashboard outage that is affecting multiple users..."*
+
+---
+
+### 2.12 — Step 5: Output — Webhook.site Downstream Capture
+
+![Webhook Site](screenshots/12-Webhook-site.png)
+
+The final JSON payload captured at Webhook.site, simulating delivery to the downstream destination queue. The raw content shows the complete structured record including all classification, enrichment, routing, and escalation fields. Multiple captures are visible in the left panel, corresponding to the five sample executions.
+
+---
+
+## 3. Architecture Write-Up
 
 The pipeline is built in n8n (cloud free tier) and processes each inbound message through six sequential nodes. Each execution is stateless — n8n holds no memory between messages. The Google Sheet is the only persistent state store: one tab for processed records, one tab for escalated records. This is intentional at this scale; it keeps the architecture simple and the output immediately auditable by a non-technical reviewer.
 
@@ -68,7 +171,7 @@ The trigger is an n8n Webhook node. A message arrives as a POST request with two
 
 ---
 
-## 3. Routing Logic
+## 4. Routing Logic
 
 **Routing map**
 
@@ -141,7 +244,7 @@ return {
 
 ---
 
-## 4. Escalation Logic
+## 5. Escalation Logic
 
 Three independent criteria trigger escalation. Any one is sufficient.
 
@@ -168,7 +271,7 @@ Sample 5 is the only escalation trigger across the five inputs. Sample 3's $260 
 
 ---
 
-## 5. Production Scale Considerations
+## 6. Production Scale Considerations
 
 **Reliability**
 n8n cloud's free tier has no uptime SLA. At production scale I would run n8n self-hosted on a VM with a persistent volume, or replace it with a proper workflow engine (Temporal or Prefect) that handles retries, dead-letter queues, and distributed execution natively. I would also add an error branch in n8n that catches LLM JSON parse failures, logs the raw response, and routes the message to the escalation queue rather than dropping it silently.
@@ -187,7 +290,7 @@ There is currently no alerting when the LLM returns malformed JSON or when Groq 
 
 ---
 
-## 6. Phase 2 — Given Another Week
+## 7. Phase 2 — Given Another Week
 
 Three additions in priority order:
 
@@ -202,7 +305,7 @@ Stamp each record with a `respond_by` deadline based on priority (High = 2h, Med
 
 ---
 
-## 7. Prompt Documentation
+## 8. Prompt Documentation
 
 ### Call 1 — Classification
 
@@ -291,7 +394,7 @@ The key structural decision was injecting `category` and `priority` from Call 1 
 
 ---
 
-## 8. Structured Output — All 5 Records
+## 9. Structured Output — All 5 Records
 
 ```json
 [
@@ -445,6 +548,11 @@ The key structural decision was injecting `category` and `priority` from Call 1 
     "processed_at": "2026-02-10T14:08:37Z"
   }
 ]
+
+## 9. Screenshots of each step with output
+![Canvas Overview](screenshots/01_n8n-workflow-canvas.png)
+
+
 ```
 
 ---
