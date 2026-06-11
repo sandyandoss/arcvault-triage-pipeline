@@ -1,5 +1,4 @@
-# ArcVault Intake Pipeline — Technical Assessment Submission
-**Valsoft AI Engineer Assessment | February 2026**
+# LlamaSort Intake Pipeline 
 
 ---
 
